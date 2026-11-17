@@ -1,21 +1,42 @@
 package api
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/blockbridge/avmcbbs/apps/mcstatus/internal/probe"
 )
 
-func NewRouter(service *probe.Service) http.Handler {
+func NewRouter(service *probe.Service, apiTokens ...string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/v1/probe", handleProbe(service))
 	mux.HandleFunc("/v1/probe/jobs", handleProbeJobs(service))
 	mux.HandleFunc("/v1/probe/jobs/", handleProbeJobDetail(service))
-	return withJSON(mux)
+	var token string
+	if len(apiTokens) > 0 {
+		token = apiTokens[0]
+	}
+	return withJSON(withInternalBearer(mux, token))
+}
+
+func withInternalBearer(next http.Handler, token string) http.Handler {
+	expected := sha256.Sum256([]byte("Bearer " + token))
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if token != "" && request.URL.Path != "/healthz" {
+			provided := sha256.Sum256([]byte(request.Header.Get("Authorization")))
+			if len(request.Header.Values("Authorization")) != 1 || subtle.ConstantTimeCompare(expected[:], provided[:]) != 1 {
+				writeErrorMessage(writer, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+		}
+		next.ServeHTTP(writer, request)
+	})
 }
 
 func handleHealth(writer http.ResponseWriter, _ *http.Request) {
@@ -39,7 +60,11 @@ func handleProbe(service *probe.Service) http.HandlerFunc {
 
 		result, err := service.Probe(request.Context(), payload)
 		if err != nil {
-			writeError(writer, http.StatusBadRequest, err)
+			statusCode := http.StatusBadRequest
+			if errors.Is(err, probe.ErrClosed) {
+				statusCode = http.StatusServiceUnavailable
+			}
+			writeError(writer, statusCode, err)
 			return
 		}
 		writeJSON(writer, http.StatusOK, result)
@@ -63,6 +88,9 @@ func handleProbeJobs(service *probe.Service) http.HandlerFunc {
 			statusCode := http.StatusBadRequest
 			if errors.Is(err, probe.ErrQueueFull) {
 				statusCode = http.StatusTooManyRequests
+			}
+			if errors.Is(err, probe.ErrClosed) {
+				statusCode = http.StatusServiceUnavailable
 			}
 			writeError(writer, statusCode, err)
 			return
@@ -95,11 +123,28 @@ func handleProbeJobDetail(service *probe.Service) http.HandlerFunc {
 }
 
 func decodeRequest(writer http.ResponseWriter, request *http.Request) (probe.Request, bool) {
+	request.Body = http.MaxBytesReader(writer, request.Body, 32*1024)
 	defer request.Body.Close()
 
 	var payload probe.Request
-	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+	decoder := json.NewDecoder(request.Body)
+	if err := decoder.Decode(&payload); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErrorMessage(writer, http.StatusRequestEntityTooLarge, "request body exceeds limit")
+			return probe.Request{}, false
+		}
 		writeErrorMessage(writer, http.StatusBadRequest, "invalid json body")
+		return probe.Request{}, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeErrorMessage(writer, http.StatusRequestEntityTooLarge, "request body exceeds limit")
+			return probe.Request{}, false
+		}
+		writeErrorMessage(writer, http.StatusBadRequest, "expected one JSON document")
 		return probe.Request{}, false
 	}
 	return payload, true

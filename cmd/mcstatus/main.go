@@ -21,7 +21,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
-		Handler:           api.NewRouter(service),
+		Handler:           api.NewRouter(service, cfg.APIToken),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
