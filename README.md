@@ -7,8 +7,6 @@
 - 执行 Java TCP 状态、基岩版 NetherNet HTTP/TCP 与 RakNet UDP 探测
 - 通过内部 HTTP API 为受信任的调用方提供独立探测能力
 
-论坛新站当前使用 `@omiyi/minecraft-ping` npm 包直接查询；本仓库的独立 Go 服务不作为该 npm 接入的必需依赖。本次保留并完善既有服务能力，不包含节点化调度。
-
 当前服务默认提供同步探测和异步任务两种模式：
 
 - `POST /v1/probe`
