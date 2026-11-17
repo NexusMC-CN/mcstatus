@@ -10,18 +10,25 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mcstatus-io/mcutil/v4/options"
 	"github.com/mcstatus-io/mcutil/v4/response"
-	"github.com/mcstatus-io/mcutil/v4/status"
 )
 
 var ErrQueueFull = errors.New("probe queue is full")
+var ErrClosed = errors.New("probe service is closed")
 
 type queuedJob struct {
 	id string
 }
 
 type Service struct {
+	io           networkIO
+	slots        chan struct{}
+	lifetime     context.Context
+	cancel       context.CancelFunc
+	active       sync.WaitGroup
+	closed       bool
+	startOnce    sync.Once
+	closeOnce    sync.Once
 	workers      int
 	timeout      time.Duration
 	jobTTL       time.Duration
@@ -34,30 +41,58 @@ type Service struct {
 }
 
 func NewService(workers int, queueSize int, timeout time.Duration, jobTTL time.Duration) *Service {
+	if 1 > workers {
+		workers = 1
+	}
+	if 1 > queueSize {
+		queueSize = 1
+	}
+	if 0 >= timeout {
+		timeout = 4 * time.Second
+	}
+	lifetime, cancel := context.WithCancel(context.Background())
 	return &Service{
-		workers: workers,
-		timeout: timeout,
-		jobTTL:  jobTTL,
-		queue:   make(chan queuedJob, queueSize),
-		jobs:    make(map[string]*Job),
-		stopCh:  make(chan struct{}),
+		workers:  workers,
+		timeout:  timeout,
+		jobTTL:   jobTTL,
+		queue:    make(chan queuedJob, queueSize),
+		jobs:     make(map[string]*Job),
+		stopCh:   make(chan struct{}),
+		io:       defaultNetworkIO(),
+		slots:    make(chan struct{}, workers),
+		lifetime: lifetime,
+		cancel:   cancel,
 	}
 }
 
 func (s *Service) Start() {
-	for i := 0; i < s.workers; i++ {
-		s.wg.Add(1)
-		go s.worker()
-	}
+	s.startOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.closed {
+			return
+		}
+		for i := 0; i < s.workers; i++ {
+			s.wg.Add(1)
+			go s.worker()
+		}
 
-	s.cleanupGroup.Add(1)
-	go s.cleanupLoop()
+		s.cleanupGroup.Add(1)
+		go s.cleanupLoop()
+	})
 }
 
 func (s *Service) Close() {
-	close(s.stopCh)
-	s.wg.Wait()
-	s.cleanupGroup.Wait()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.cancel()
+		close(s.stopCh)
+		s.mu.Unlock()
+		s.wg.Wait()
+		s.cleanupGroup.Wait()
+		s.active.Wait()
+	})
 }
 
 func (s *Service) Probe(ctx context.Context, req Request) (*Result, error) {
@@ -65,22 +100,32 @@ func (s *Service) Probe(ctx context.Context, req Request) (*Result, error) {
 }
 
 func (s *Service) Submit(req Request) (*Job, error) {
+	if err := validateRequest(normalizeRequest(req)); err != nil {
+		return nil, err
+	}
 	now := time.Now().UTC()
 	job := &Job{
 		ID:        newJobID(),
 		Status:    JobPending,
-		Request:   req,
+		Request:   cloneRequest(req),
 		CreatedAt: now,
 		ExpiresAt: now.Add(s.jobTTL),
 	}
 
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, ErrClosed
+	}
 	s.jobs[job.ID] = job
 	s.mu.Unlock()
 
 	select {
 	case s.queue <- queuedJob{id: job.ID}:
-		return cloneJob(job), nil
+		s.mu.RLock()
+		snapshot := cloneJob(job)
+		s.mu.RUnlock()
+		return snapshot, nil
 	default:
 		s.mu.Lock()
 		delete(s.jobs, job.ID)
@@ -92,11 +137,12 @@ func (s *Service) Submit(req Request) (*Job, error) {
 func (s *Service) GetJob(id string) (*Job, bool) {
 	s.mu.RLock()
 	job, ok := s.jobs[id]
+	snapshot := cloneJob(job)
 	s.mu.RUnlock()
 	if !ok {
 		return nil, false
 	}
-	return cloneJob(job), true
+	return snapshot, true
 }
 
 func (s *Service) worker() {
@@ -153,19 +199,36 @@ func (s *Service) executeJob(id string) {
 }
 
 func (s *Service) runProbe(ctx context.Context, req Request) (*Result, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, ErrClosed
+	}
+	s.active.Add(1)
+	s.mu.Unlock()
+	defer s.active.Done()
+	ctx, cancel := context.WithTimeout(ctx, s.effectiveTimeout(req))
+	defer cancel()
+	stop := context.AfterFunc(s.lifetime, cancel)
+	defer stop()
 	req = normalizeRequest(req)
 	if err := validateRequest(req); err != nil {
 		return nil, err
 	}
-	if err := validatePublicTarget(req.Host); err != nil {
-		return nil, err
+	select {
+	case s.slots <- struct{}{}:
+		defer func() { <-s.slots }()
+	case <-ctx.Done():
+		return buildErrorResult(req, classifyProbeError(ctx.Err())), nil
 	}
-
+	if err := ctx.Err(); err != nil {
+		return buildErrorResult(req, classifyProbeError(err)), nil
+	}
 	switch req.Platform {
 	case PlatformBedrock:
-		return probeBedrock(ctx, req)
+		return s.probeBedrockTransport(ctx, req)
 	default:
-		return probeJava(ctx, req)
+		return s.probeJavaPinned(ctx, req)
 	}
 }
 
@@ -205,39 +268,6 @@ func (s *Service) cleanupExpiredJobs() {
 			delete(s.jobs, id)
 		}
 	}
-}
-
-func probeJava(ctx context.Context, req Request) (*Result, error) {
-	timeout := timeoutFromContext(ctx, 5*time.Second)
-	modern, modernErr := status.Modern(ctx, req.Host, uint16(req.Port), options.StatusModern{
-		EnableSRV: true,
-		Timeout:   timeout,
-		Ping:      true,
-	})
-	if modernErr == nil {
-		return buildJavaModernResult(req, modern), nil
-	}
-
-	legacy, legacyErr := status.Legacy(ctx, req.Host, uint16(req.Port), options.StatusLegacy{
-		EnableSRV: true,
-		Timeout:   timeout,
-	})
-	if legacyErr == nil {
-		return buildJavaLegacyResult(req, legacy), nil
-	}
-
-	return buildErrorResult(req, classifyProbeError(modernErr, legacyErr)), nil
-}
-
-func probeBedrock(ctx context.Context, req Request) (*Result, error) {
-	timeout := timeoutFromContext(ctx, 5*time.Second)
-	bedrock, err := status.Bedrock(ctx, req.Host, uint16(req.Port), options.StatusBedrock{
-		Timeout: timeout,
-	})
-	if err != nil {
-		return buildErrorResult(req, classifyProbeError(err)), nil
-	}
-	return buildBedrockResult(req, bedrock), nil
 }
 
 func buildJavaModernResult(req Request, data *response.StatusModern) *Result {
@@ -359,6 +389,7 @@ func applySRVRecord(result *Result, fallbackHost string, srv *response.SRVRecord
 }
 
 func normalizeRequest(req Request) Request {
+	req = cloneRequest(req)
 	req.Platform = Platform(strings.ToLower(strings.TrimSpace(string(req.Platform))))
 	req.Host = strings.TrimSpace(req.Host)
 	if req.Platform == "" {
@@ -378,6 +409,9 @@ func validateRequest(req Request) error {
 	if req.Platform != PlatformJava && req.Platform != PlatformBedrock {
 		return fmt.Errorf("unsupported platform: %s", req.Platform)
 	}
+	if req.Platform == PlatformBedrock {
+		return validateBedrockRequest(req)
+	}
 	if req.Host == "" {
 		return errors.New("host is required")
 	}
@@ -389,7 +423,7 @@ func validateRequest(req Request) error {
 
 func validatePublicTarget(host string) error {
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		if !publicIP(ip) {
 			return errors.New("private or local network targets are not allowed")
 		}
 		return nil
@@ -397,14 +431,17 @@ func validatePublicTarget(host string) error {
 
 	ips, err := net.LookupIP(host)
 	if err != nil {
-		return nil
+		return errors.New("target DNS resolution failed")
+	}
+	if len(ips) == 0 {
+		return errors.New("target DNS resolution returned no addresses")
 	}
 	for _, ip := range ips {
 		addr, ok := netip.AddrFromSlice(ip)
 		if !ok {
 			continue
 		}
-		if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
+		if !publicIP(addr) {
 			return errors.New("private or local network targets are not allowed")
 		}
 	}
@@ -466,5 +503,39 @@ func cloneJob(job *Job) *Job {
 		return nil
 	}
 	copyJob := *job
+	copyJob.Request = cloneRequest(job.Request)
+	copyJob.Result = cloneResult(job.Result)
+	copyJob.Error = clonePointer(job.Error)
+	copyJob.StartedAt = clonePointer(job.StartedAt)
+	copyJob.EndedAt = clonePointer(job.EndedAt)
 	return &copyJob
+}
+
+func clonePointer[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+func cloneResult(value *Result) *Result {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	copied.Latency = clonePointer(value.Latency)
+	copied.OnlineCount = clonePointer(value.OnlineCount)
+	copied.MaxPlayers = clonePointer(value.MaxPlayers)
+	copied.Protocol = clonePointer(value.Protocol)
+	copied.Version = clonePointer(value.Version)
+	copied.Motd = clonePointer(value.Motd)
+	copied.Favicon = clonePointer(value.Favicon)
+	copied.GameMode = clonePointer(value.GameMode)
+	copied.MapName = clonePointer(value.MapName)
+	copied.Error = clonePointer(value.Error)
+	copied.ResolvedHost = clonePointer(value.ResolvedHost)
+	copied.ResolvedPort = clonePointer(value.ResolvedPort)
+	copied.SamplePlayer = append([]string{}, value.SamplePlayer...)
+	return &copied
 }

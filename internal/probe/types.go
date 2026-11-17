@@ -4,6 +4,20 @@ import "time"
 
 type Platform string
 
+type BedrockTransport string
+
+const (
+	BedrockTransportAuto      BedrockTransport = "auto"
+	BedrockTransportNetherNet BedrockTransport = "nethernet"
+	BedrockTransportRakNet    BedrockTransport = "raknet"
+)
+
+type Endpoint struct {
+	Host   string `json:"host"`
+	Port   int    `json:"port,omitempty"`
+	Scheme string `json:"scheme,omitempty"`
+}
+
 const (
 	PlatformJava    Platform = "java"
 	PlatformBedrock Platform = "bedrock"
@@ -19,31 +33,35 @@ const (
 )
 
 type Request struct {
-	Platform  Platform `json:"platform"`
-	Host      string   `json:"host"`
-	Port      int      `json:"port"`
-	TimeoutMS int      `json:"timeoutMs,omitempty"`
+	Platform          Platform         `json:"platform"`
+	Host              string           `json:"host"`
+	Port              int              `json:"port"`
+	TimeoutMS         int              `json:"timeoutMs,omitempty"`
+	BedrockTransport  BedrockTransport `json:"bedrock_transport,omitempty"`
+	NetherNetEndpoint *Endpoint        `json:"nethernet_endpoint,omitempty"`
+	RakNetEndpoint    *Endpoint        `json:"raknet_endpoint,omitempty"`
 }
 
 type Result struct {
-	Platform     Platform  `json:"platform"`
-	State        State     `json:"state"`
-	CheckedAt    time.Time `json:"checkedAt"`
-	IsOnline     bool      `json:"isOnline"`
-	Latency      *int64    `json:"latency"`
-	OnlineCount  *int64    `json:"onlineCount"`
-	MaxPlayers   *int64    `json:"maxPlayers"`
-	Version      *string   `json:"version"`
-	Protocol     *int64    `json:"protocol"`
-	Motd         *string   `json:"motd"`
-	Favicon      *string   `json:"favicon"`
-	GameMode     *string   `json:"gameMode"`
-	MapName      *string   `json:"mapName"`
-	SamplePlayer []string  `json:"samplePlayers"`
-	Source       string    `json:"source"`
-	Error        *string   `json:"error"`
-	ResolvedHost *string   `json:"resolvedHost"`
-	ResolvedPort *int      `json:"resolvedPort"`
+	Platform         Platform         `json:"platform"`
+	State            State            `json:"state"`
+	CheckedAt        time.Time        `json:"checkedAt"`
+	IsOnline         bool             `json:"isOnline"`
+	Latency          *int64           `json:"latency"`
+	OnlineCount      *int64           `json:"onlineCount"`
+	MaxPlayers       *int64           `json:"maxPlayers"`
+	Version          *string          `json:"version"`
+	Protocol         *int64           `json:"protocol"`
+	Motd             *string          `json:"motd"`
+	Favicon          *string          `json:"favicon"`
+	GameMode         *string          `json:"gameMode"`
+	MapName          *string          `json:"mapName"`
+	SamplePlayer     []string         `json:"samplePlayers"`
+	Source           string           `json:"source"`
+	Error            *string          `json:"error"`
+	ResolvedHost     *string          `json:"resolvedHost"`
+	ResolvedPort     *int             `json:"resolvedPort"`
+	BedrockTransport BedrockTransport `json:"bedrock_transport,omitempty"`
 }
 
 type JobStatus string
